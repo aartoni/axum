@@ -311,14 +311,15 @@ where
                 .get(&id)
                 .expect("no path for route id. This is a bug in axum. Please file an issue");
             self = match route {
-                Endpoint::MethodRouter(method_router) => self.route(
-                    path,
-                    method_router
+                Endpoint::MethodRouter(method_router) => {
+                    let method_router = match state {
                         // this will set the state for each route
                         // such we don't override the inner state later in `MethodRouterWithState`
-                        .layer(Extension(Arc::clone(&state)))
-                        .downcast_state(),
-                ),
+                        Some(s) => method_router.layer(Extension(Arc::clone(&s))),
+                        None => method_router,
+                    };
+                    self.route(path, method_router.downcast_state())
+                }
                 Endpoint::Route(route) => self.route_service(path, route),
             };
         }
