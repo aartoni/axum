@@ -13,6 +13,7 @@ use axum_core::response::IntoResponse;
 use http::Request;
 use matchit::MatchError;
 use std::{
+    any::{type_name, TypeId},
     collections::HashMap,
     convert::Infallible,
     fmt,
@@ -62,7 +63,7 @@ impl RouteId {
 
 /// The router type for composing handlers and services.
 pub struct Router<S = (), B = Body> {
-    state: Arc<S>,
+    state: Option<Arc<S>>,
     routes: HashMap<RouteId, Endpoint<S, B>>,
     node: Arc<Node>,
     fallback: Fallback<B>,
@@ -71,7 +72,7 @@ pub struct Router<S = (), B = Body> {
 impl<S, B> Clone for Router<S, B> {
     fn clone(&self) -> Self {
         Self {
-            state: Arc::clone(&self.state),
+            state: self.state.clone(),
             routes: self.routes.clone(),
             node: Arc::clone(&self.node),
             fallback: self.fallback.clone(),
@@ -165,7 +166,16 @@ where
     /// [`State`]: crate::extract::State
     pub fn with_state_arc(state: Arc<S>) -> Self {
         Self {
-            state,
+            state: Some(state),
+            routes: Default::default(),
+            node: Default::default(),
+            fallback: Fallback::Default(Route::new(NotFound)),
+        }
+    }
+
+    pub fn inherit_state() -> Self {
+        Self {
+            state: None,
             routes: Default::default(),
             node: Default::default(),
             fallback: Fallback::Default(Route::new(NotFound)),
@@ -305,6 +315,31 @@ where
             fallback,
         } = other.into();
 
+        let state = match state {
+            // other has its state set
+            Some(s) => Some(s),
+            // other wants to inherit its state
+            None => match &self.state {
+                // self has state, attempt to inherit
+                Some(s) => match try_downcast::<Arc<S2>, Arc<S>>(Arc::clone(s)) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        panic!(
+                            "can't merge a `Router` that wants to inherit state of type `{}`\
+                             into a `Router` that holds state of type `{}`",
+                            type_name::<S2>(),
+                            type_name::<S>(),
+                        );
+                    }
+                },
+                // both `Router`s inherit the same state type
+                None if TypeId::of::<S>() == TypeId::of::<S2>() => None,
+                None => {
+                    panic!("can't merge two `Router`s that want to inherit different state types");
+                }
+            },
+        };
+
         for (id, route) in routes {
             let path = node
                 .route_id_to_path
@@ -312,10 +347,10 @@ where
                 .expect("no path for route id. This is a bug in axum. Please file an issue");
             self = match route {
                 Endpoint::MethodRouter(method_router) => {
-                    let method_router = match state {
+                    let method_router = match &state {
                         // this will set the state for each route
                         // such we don't override the inner state later in `MethodRouterWithState`
-                        Some(s) => method_router.layer(Extension(Arc::clone(&s))),
+                        Some(s) => method_router.layer(Extension(Arc::clone(s))),
                         None => method_router,
                     };
                     self.route(path, method_router.downcast_state())
@@ -421,13 +456,14 @@ where
     }
 
     #[doc = include_str!("../docs/routing/fallback.md")]
-    pub fn fallback<H, T>(self, handler: H) -> Self
+    pub fn fallback<H, T>(self, _handler: H) -> Self
     where
         H: Handler<T, S, B>,
         T: 'static,
     {
-        let state = Arc::clone(&self.state);
-        self.fallback_service(handler.with_state_arc(state))
+        //let state = Arc::clone(&self.state);
+        //self.fallback_service(handler.with_state_arc(state))
+        todo!()
     }
 
     /// Add a fallback [`Service`] to the router.
@@ -526,18 +562,24 @@ where
             .expect("no route for id. This is a bug in axum. Please file an issue")
             .clone();
 
+        // FIXME: This could become a strict init-time check if we moved the `Service` impl to
+        //        a separate type that has to be created with `.into_service()`. Then this check
+        //        would only happen once.
+        let state = self.state.clone().expect(
+            "can't use a `Router` that wants to inherit state without first merging it into \
+             a `Router` that supplies that state",
+        );
+
         match &mut route {
-            Endpoint::MethodRouter(inner) => inner
-                .clone()
-                .with_state_arc(Arc::clone(&self.state))
-                .call(req),
+            Endpoint::MethodRouter(inner) => inner.clone().with_state_arc(state).call(req),
             Endpoint::Route(inner) => inner.call(req),
         }
     }
 
     /// Get a reference to the state.
-    pub fn state(&self) -> &S {
-        &self.state
+    pub fn state(&self) -> Option<&S> {
+        // FIXME: Is this method still worth much if it returns `Option<_>`?
+        self.state.as_deref()
     }
 }
 
